@@ -42,8 +42,9 @@ Correctness checks, independent of any search result:
 uv run python tools/check_engine.py
 ```
 
-Known weakness: KR v K and KBB v K do not convert to mate in that checker (repetition and
-fifty-move draws). KQ v K and KP v K do.
+All four endgames in that checker convert as of 2026-09-07: KQ v K in 13 plies, KP v K in 32,
+KR v K in 41, KBB v K in 51. The README used to record KR v K and KBB v K as failing; that is
+no longer true and the note was misleading us about where the drawn rated games come from.
 
 ## What's here
 
@@ -52,6 +53,9 @@ agent.py             the submission
 submission.zip       agent.py zipped at the root, ready to upload
 tools/check_engine.py  perft, random-playout cross-check against python-chess, endgame conversion
 tools/find_magics.py   regenerates the magic multipliers in agent.py
+tools/gauntlet.py      many games against another version, with an Elo interval and a verdict
+tools/openings.py      regenerates tools/openings.epd, the balanced start positions it uses
+tools/openings.epd     120 positions eight plies out of book, all within 60 cp of level
 snapshots/stage1/    pure-Python negamax over python-chess, material eval
 snapshots/stage4/    same plus numba-jitted tapered eval, TT, killers, quiescence (the 152nd-place agent)
 snapshots/stage5/    the bitboard engine, identical to the current agent.py
