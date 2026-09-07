@@ -1029,6 +1029,13 @@ def quiesce(
     game_hashes: np.ndarray, alpha: int, beta: int,
 ) -> int:
     ctrl[C_NODES] += 1
+    # Quiescence nodes outnumber the rest at any real depth, so polling only in negamax left
+    # whole capture trees running with nobody watching the clock.
+    if ctrl[C_NODES] & (NODES_PER_CLOCK_CHECK - 1) == 0:
+        with objmode(now="float64"):
+            now = time.monotonic()
+        if now >= clock[0]:
+            ctrl[C_STOP] = 1
     if ctrl[C_STOP]:
         return 0
     pos = stack[ply]
@@ -1256,6 +1263,7 @@ def search_root(
     side = pos[SIDE]
     n = gen_moves(pos, tables, moves[0], 0)
     score_moves(pos, moves, 0, n, ctrl[C_ROOT_BEST], history, killers)
+    alpha_orig = alpha
     best = -INF
     best_move = 0
     legal = 0
@@ -1293,7 +1301,11 @@ def search_root(
                 if alpha >= beta:
                     break
     if not ctrl[C_STOP] and best_move != 0 and best > -INF:
-        flag = TT_LOWER if best >= beta else (TT_EXACT if alpha > -INF else TT_UPPER)
+        # An aspiration window arrives here with alpha already above -INF, so testing alpha
+        # against -INF called every fail-low exact and wrote a bound into the table as though
+        # it were a true score. The comparison that matters is against the alpha we started
+        # with, exactly as negamax does it.
+        flag = TT_LOWER if best >= beta else (TT_EXACT if best > alpha_orig else TT_UPPER)
         tt_store(tt, pos[HASH], best_move, depth, flag, best, ctrl[C_AGE])
     return best
 
@@ -1306,6 +1318,13 @@ def search_root(
 INCREMENT_MS = 500.0
 SAFETY_MS = 150.0
 MOVES_HORIZON = 24  # spend about this fraction of the remaining clock per move
+# The soft budget decides whether to open another iteration; the hard budget is where the
+# search is abandoned part-way through one, and only a root that is still changing its mind
+# ever gets there. Rated games were finishing with a fifth of the clock unspent because the
+# old single budget stopped deepening at 45% of it and had nothing to spend the rest on.
+HARD_MULTIPLIER = 2.0
+CONTINUE_FRACTION = 0.62  # open another iteration only while this much of soft is unspent
+UNSTABLE_FRACTION = 0.85  # ... and stretch to here when the last iteration changed its mind
 
 stack = np.zeros((MAX_PLY + 2, POS_LEN), dtype=np.int64)
 moves = np.zeros((MAX_PLY + 2, MAX_MOVES), dtype=np.int64)
@@ -1416,15 +1435,43 @@ def _fallback(board: chess.Board, legal: list[chess.Move]) -> chess.Move:
     return max(legal, key=gain)
 
 
-def _budget_ms(time_left_ms: int) -> float:
-    budget = min(time_left_ms / MOVES_HORIZON + 0.8 * INCREMENT_MS, time_left_ms / 4.0)
-    return max(budget - SAFETY_MS, 10.0)
+def _budget_ms(time_left_ms: int) -> tuple[float, float]:
+    """The soft and hard budgets for this move, in milliseconds.
+
+    The referee flags on wall time the moment the clock goes negative, so the hard budget
+    stays a long way short of what is left even when the root is in trouble.
+    """
+    soft = min(time_left_ms / MOVES_HORIZON + 0.8 * INCREMENT_MS, time_left_ms / 4.0)
+    soft = max(soft - SAFETY_MS, 10.0)
+    hard = min(HARD_MULTIPLIER * soft, time_left_ms / 3.0 - SAFETY_MS)
+    return soft, max(hard, soft)
+
+
+def _forced_move() -> int:
+    """The only legal move in stack[0], or 0 when there is a choice.
+
+    Called with stack[0] already set. Searching a position with one legal reply spends the
+    whole budget to be told what we already know, and the clock is not refunded.
+    """
+    n = gen_moves(stack[0], tables, moves[0], 0)
+    side = int(stack[0, SIDE])
+    only = 0
+    for i in range(n):
+        candidate = int(moves[0, i] & MOVE_MASK)
+        make_move(stack, 0, tables, candidate)
+        if left_king_in_check(stack, 0, tables, side):
+            continue
+        if only:
+            return 0
+        only = candidate
+    return only
 
 
 def _think(board: chess.Board, time_left_ms: int) -> str:
     start = time.monotonic()
     _stop_ponder()
-    budget_s = _budget_ms(time_left_ms) / 1000.0
+    soft_ms, hard_ms = _budget_ms(time_left_ms)
+    soft_s, hard_s = soft_ms / 1000.0, hard_ms / 1000.0
     stack[0] = position_from_board(board, tables)
     root_hash = int(stack[0, HASH])
     history_len = min(len(_game), len(GAME_HASHES))
@@ -1437,41 +1484,55 @@ def _think(board: chess.Board, time_left_ms: int) -> str:
     CTRL[C_HISTORY_LEN] = history_len
     CTRL[C_SELDEPTH] = 0
     CTRL[C_ROOT_SIDE] = int(stack[0, SIDE])
-    CLOCK[0] = start + budget_s
+    CLOCK[0] = start + soft_s
     KILLERS[:] = 0
     HISTORY[:] >>= 2
 
-    best = 0
+    best = _forced_move()
+    if best:
+        # Nothing to decide. The clock is worth more on the position after it, which the
+        # ponder thread below is about to start on anyway.
+        print(f"forced {move_to_uci(best)}")
     score = 0
-    for depth in range(1, MAX_DEPTH + 1):
-        window = 30 if depth >= 5 else INF
-        alpha, beta = max(score - window, -INF), min(score + window, INF)
-        while True:
-            value = search_root(
-                stack, 0, tables, moves, TT, HISTORY, KILLERS, CTRL, CLOCK, GAME_HASHES,
-                depth, alpha, beta,
-            )
+    if not best:
+        for depth in range(1, MAX_DEPTH + 1):
+            window = 30 if depth >= 5 else INF
+            alpha, beta = max(score - window, -INF), min(score + window, INF)
+            previous = best
+            while True:
+                value = search_root(
+                    stack, 0, tables, moves, TT, HISTORY, KILLERS, CTRL, CLOCK, GAME_HASHES,
+                    depth, alpha, beta,
+                )
+                if CTRL[C_STOP]:
+                    break
+                if value <= alpha:
+                    # The root is failing low: the move we were about to play is worse than we
+                    # thought and we have no replacement yet. This is the one case worth the
+                    # hard budget for.
+                    CLOCK[0] = start + hard_s
+                    alpha = max(alpha - window, -INF)
+                elif value >= beta:
+                    beta = min(beta + window, INF)
+                else:
+                    score = value
+                    break
+                window *= 2
+            if CTRL[C_ROOT_BEST]:
+                best = int(CTRL[C_ROOT_BEST])
             if CTRL[C_STOP]:
                 break
-            if value <= alpha:
-                alpha = max(alpha - window, -INF)
-            elif value >= beta:
-                beta = min(beta + window, INF)
-            else:
-                score = value
+            elapsed = time.monotonic() - start
+            print(
+                f"depth {depth}/{int(CTRL[C_SELDEPTH])} score {score} move {move_to_uci(best)} "
+                f"nodes {int(CTRL[C_NODES])} time {elapsed:.2f}s"
+            )
+            if abs(score) >= MATE_BOUND:
                 break
-            window *= 2
-        if CTRL[C_ROOT_BEST]:
-            best = int(CTRL[C_ROOT_BEST])
-        if CTRL[C_STOP]:
-            break
-        elapsed = time.monotonic() - start
-        print(
-            f"depth {depth}/{int(CTRL[C_SELDEPTH])} score {score} move {move_to_uci(best)} "
-            f"nodes {int(CTRL[C_NODES])} time {elapsed:.2f}s"
-        )
-        if abs(score) >= MATE_BOUND or elapsed > 0.45 * budget_s:
-            break
+            limit = UNSTABLE_FRACTION if best != previous else CONTINUE_FRACTION
+            if elapsed > limit * soft_s:
+                break
+            CLOCK[0] = start + soft_s  # any fail-low is resolved; back to the normal budget
 
     if best == 0:  # never happens with a legal position, but never return nothing
         n = gen_moves(stack[0], tables, moves[0], 0)
